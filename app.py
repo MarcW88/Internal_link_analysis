@@ -6,7 +6,7 @@ os.environ["XDG_CACHE_HOME"] = "/tmp"
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import matplotlib
 matplotlib.use("Agg")
@@ -75,6 +75,43 @@ def get_domain(url):
         return urlparse(str(url)).netloc.lower().replace('www.', '')
     except:
         return ''
+
+
+def normalize_url(url, base_url=None):
+    try:
+        value = str(url).strip()
+        if not value or value.lower() == 'nan':
+            return ''
+        if base_url and not urlparse(value).netloc:
+            value = urljoin(str(base_url).strip(), value)
+        parsed = urlparse(value)
+        if not parsed.scheme and parsed.netloc:
+            value = f"https:{value}" if value.startswith("//") else f"https://{value}"
+        return value.rstrip('/') if value != '/' else value
+    except:
+        return str(url).strip()
+
+
+def url_key(url):
+    try:
+        return normalize_url(url).lower()
+    except:
+        return str(url).strip().lower().rstrip('/')
+
+
+def to_number(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(str(value).replace(',', '.').strip())
+    except:
+        return default
+
+
+def to_text(value):
+    if pd.isna(value):
+        return ''
+    return str(value).strip()
 
 
 def compute_similarity(anchor, title):
@@ -146,7 +183,7 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
                 'indexabilité': 'Indexability', 'indexability': 'Indexability',
                 'h1-1': 'H1', 'h1': 'H1',
                 'nombre de mots': 'WordCount', 'word count': 'WordCount',
-                'profondeur de crawl': 'CrawlDepth', 'crawl depth': 'CrawlDepth',
+                'profondeur de crawl': 'CrawlDepth', 'crawl profondeur': 'CrawlDepth', 'crawl depth': 'CrawlDepth',
             }
             for col in df_crawl.columns:
                 col_lower = col.lower().strip()
@@ -156,14 +193,14 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
             # Build lookup dict
             if 'Address' in df_crawl.columns:
                 for _, row in df_crawl.iterrows():
-                    url = str(row['Address']).strip()
-                    crawl_data[url] = {
-                        'Title': row.get('Title', ''),
-                        'H1': row.get('H1', ''),
-                        'MetaDesc': row.get('MetaDesc', ''),
-                        'Indexability': row.get('Indexability', ''),
-                        'WordCount': row.get('WordCount', 0),
-                        'CrawlDepth': row.get('CrawlDepth', 0),
+                    url = normalize_url(row['Address'])
+                    crawl_data[url_key(url)] = {
+                        'Title': to_text(row.get('Title', '')),
+                        'H1': to_text(row.get('H1', '')),
+                        'MetaDesc': to_text(row.get('MetaDesc', '')),
+                        'Indexability': to_text(row.get('Indexability', '')),
+                        'WordCount': to_number(row.get('WordCount', 0)),
+                        'CrawlDepth': to_number(row.get('CrawlDepth', 0)),
                     }
         except Exception as e:
             st.warning(f"Erreur lecture crawl: {e}")
@@ -177,10 +214,15 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
         df['Anchor'] = ''
     
     # Clean data
-    df['To'] = df['To'].astype(str).str.strip()
-    df['Anchor'] = df['Anchor'].fillna('').astype(str).str.strip()
     if 'From' in df.columns:
         df['From'] = df['From'].astype(str).str.strip()
+    df['To'] = df.apply(
+        lambda row: normalize_url(row['To'], row['From'] if 'From' in df.columns else None),
+        axis=1
+    )
+    df['Anchor'] = df['Anchor'].fillna('').astype(str).str.strip()
+    if 'From' in df.columns:
+        df['From'] = df['From'].apply(normalize_url)
     
     # Extract domains
     df['ToDomain'] = df['To'].apply(get_domain)
@@ -368,13 +410,24 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
         }
         
         # Add crawl data
-        if url in crawl_data:
-            page_analysis[url].update(crawl_data[url])
+        crawl_match = crawl_data.get(url_key(url))
+        if crawl_match:
+            page_analysis[url].update(crawl_match)
         else:
             page_analysis[url].update({
                 'Title': '', 'WordCount': 0, 'Indexability': '', 
                 'CrawlDepth': 0, 'H1': '', 'MetaDesc': ''
             })
+
+    for url, data in crawl_data.items():
+        if url not in page_analysis:
+            page_analysis[url] = {
+                'incoming_links': len(df_all[df_all['To'].apply(url_key) == url_key(url)]),
+                'content_incoming': len(df_content[df_content['To'].apply(url_key) == url_key(url)]),
+                'nav_incoming': len(df_nav[df_nav['To'].apply(url_key) == url_key(url)]),
+                'footer_incoming': len(df_footer[df_footer['To'].apply(url_key) == url_key(url)]),
+                **data
+            }
     
     # Build outgoing links map
     outgoing_map = {}
