@@ -114,6 +114,34 @@ def to_text(value):
     return str(value).strip()
 
 
+def detect_language(url, language_value=None):
+    lang_text = to_text(language_value).lower()
+    if lang_text:
+        if lang_text.startswith('fr'):
+            return 'fr'
+        if lang_text.startswith('nl'):
+            return 'nl'
+        if lang_text.startswith('de'):
+            return 'de'
+        if lang_text.startswith('en'):
+            return 'en'
+    try:
+        first_part = urlparse(str(url)).path.strip('/').split('/')[0].lower()
+        return first_part if first_part in {'fr', 'nl', 'de', 'en'} else ''
+    except:
+        return ''
+
+
+def is_low_value_linking_page(url):
+    path = urlparse(str(url)).path.lower()
+    low_value_terms = [
+        'privacy', 'politique-cookies', 'cookies', 'cookie', 'confidentialite',
+        'datenschutz', 'mentions-legales', 'legal', 'conditions', 'terms',
+        'sitemap', 'wp-', 'cdn-cgi'
+    ]
+    return any(term in path for term in low_value_terms)
+
+
 def compute_similarity(anchor, title):
     if not anchor or not title or pd.isna(anchor) or pd.isna(title):
         return 0.0
@@ -158,7 +186,7 @@ def classify_anchor(anchor):
 # Main Processing
 # ------------------------
 
-def process_files(inlinks_file, crawl_file=None, target_domain=None):
+def process_files(inlinks_file, crawl_file=None, target_domain=None, target_language='Toutes'):
     if inlinks_file is None:
         return None, "Veuillez uploader un fichier Inlinks"
     
@@ -184,6 +212,7 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
                 'h1-1': 'H1', 'h1': 'H1',
                 'nombre de mots': 'WordCount', 'word count': 'WordCount',
                 'profondeur de crawl': 'CrawlDepth', 'crawl profondeur': 'CrawlDepth', 'crawl depth': 'CrawlDepth',
+                'language': 'Language', 'langue': 'Language',
             }
             for col in df_crawl.columns:
                 col_lower = col.lower().strip()
@@ -194,6 +223,9 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
             if 'Address' in df_crawl.columns:
                 for _, row in df_crawl.iterrows():
                     url = normalize_url(row['Address'])
+                    detected_lang = detect_language(url, row.get('Language', ''))
+                    if target_language and target_language != 'Toutes' and detected_lang != target_language:
+                        continue
                     crawl_data[url_key(url)] = {
                         'Title': to_text(row.get('Title', '')),
                         'H1': to_text(row.get('H1', '')),
@@ -201,6 +233,7 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
                         'Indexability': to_text(row.get('Indexability', '')),
                         'WordCount': to_number(row.get('WordCount', 0)),
                         'CrawlDepth': to_number(row.get('CrawlDepth', 0)),
+                        'Language': detected_lang,
                     }
         except Exception as e:
             st.warning(f"Erreur lecture crawl: {e}")
@@ -228,6 +261,15 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
     df['ToDomain'] = df['To'].apply(get_domain)
     if 'From' in df.columns:
         df['FromDomain'] = df['From'].apply(get_domain)
+
+    df['ToLanguage'] = df['To'].apply(detect_language)
+    if 'From' in df.columns:
+        df['FromLanguage'] = df['From'].apply(detect_language)
+    else:
+        df['FromLanguage'] = ''
+
+    if target_language and target_language != 'Toutes':
+        df = df[(df['ToLanguage'] == target_language) | (df['FromLanguage'] == target_language)].copy()
     
     # Auto-detect target domain if not provided
     if not target_domain and 'FromDomain' in df.columns:
@@ -260,7 +302,8 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
     # 2. Non-hyperlinks (Canonical, Hreflang, Image, Sitemap, etc.)
     if 'Type' in df.columns:
         non_link_types = ['canonique', 'canonical', 'hreflang', 'image', 'sitemap', 'divers', 
-                         'css', 'javascript', 'js', 'font', 'video', 'audio', 'iframe']
+                         'css', 'javascript', 'js', 'font', 'police', 'video', 'audio', 'iframe',
+                         'rel prev', 'rel next', 'redirection']
         for t in non_link_types:
             mask = df['Type'].str.lower().str.contains(t, na=False) & (df['ExcludeReason'] == '')
             df.loc[mask, 'ExcludeReason'] = f'Type:{t.title()}'
@@ -453,6 +496,9 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None):
         # Pages HUB candidates (rich content, already linking out)
         if (word_count > 200 and url in outgoing_map and 
             outgoing_map[url]['outgoing_content'] >= 2 and indexable):
+            return 'HUB'
+
+        if (word_count >= 800 and indexable and not is_low_value_linking_page(url)):
             return 'HUB'
         
         # Pages to BOOST (good content but few links)
@@ -800,15 +846,16 @@ with col1:
 with col2:
     crawl_file = st.file_uploader("📄 Export Crawl (optionnel)", type=["csv", "xlsx", "xls"])
 
-# Domain filter
+# Domain and language filters
 target_domain = st.text_input("🌐 Domaine cible (auto-détecté si vide)", placeholder="example.com")
+target_language = st.selectbox("🌍 Langue à analyser", ["Toutes", "fr", "nl", "de", "en"], index=0)
 
 if st.button("🔍 Analyser", use_container_width=True, type="primary"):
     if inlinks_file is None:
         st.error("Veuillez uploader un fichier Inlinks")
     else:
         with st.spinner("Analyse en cours..."):
-            results, error = process_files(inlinks_file, crawl_file, target_domain)
+            results, error = process_files(inlinks_file, crawl_file, target_domain, target_language)
         
         if error:
             st.error(error)
