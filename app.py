@@ -3,10 +3,15 @@ import os
 os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
 os.environ["XDG_CACHE_HOME"] = "/tmp"
 
+import time
+import re
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
+
+import requests
+from bs4 import BeautifulSoup
 
 import matplotlib
 matplotlib.use("Agg")
@@ -16,6 +21,115 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 import streamlit as st
+
+
+# ------------------------
+# Scraping Engine (Firecrawl + BS4 fallback)
+# ------------------------
+
+def _get_firecrawl_key():
+    """Read Firecrawl key from Streamlit secrets or env."""
+    try:
+        key = st.secrets.get("FIRECRAWL_API_KEY", "")
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    return os.getenv("FIRECRAWL_API_KEY", "")
+
+
+def scrape_firecrawl(url: str, api_key: str, max_chars: int = 12_000) -> str | None:
+    """Scrape a page via Firecrawl v1, return markdown text or None on failure."""
+    try:
+        resp = requests.post(
+            "https://api.firecrawl.dev/v1/scrape",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        text = resp.json().get("data", {}).get("markdown", "")
+        return text[:max_chars] if text else None
+    except Exception:
+        return None
+
+
+def scrape_bs4(url: str, max_chars: int = 12_000) -> str | None:
+    """Fallback: requests + BeautifulSoup."""
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; InternalLinkAnalyzer/2.0)"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        return text[:max_chars] if text else None
+    except Exception:
+        return None
+
+
+def scrape_page(url: str, api_key: str = "", max_chars: int = 12_000) -> str:
+    """Firecrawl first, BS4 as fallback. Returns empty string on total failure."""
+    if api_key:
+        text = scrape_firecrawl(url, api_key, max_chars)
+        if text:
+            return text
+    return scrape_bs4(url, max_chars) or ""
+
+
+def find_anchor_in_content(anchor: str, content: str, context_chars: int = 120):
+    """
+    Look for the anchor text (case-insensitive) in the scraped content.
+    Returns (found: bool, snippet: str)
+    """
+    if not anchor or not content:
+        return False, ""
+    pattern = re.compile(re.escape(anchor.strip()), re.IGNORECASE)
+    m = pattern.search(content)
+    if not m:
+        return False, ""
+    start = max(0, m.start() - context_chars)
+    end   = min(len(content), m.end() + context_chars)
+    raw   = content[start:end].replace("\n", " ").strip()
+    # highlight the match
+    snippet = ("\u2026" if start > 0 else "") + raw + ("\u2026" if end < len(content) else "")
+    return True, snippet
+
+
+def enrich_recommendations_with_content(df_recs: "pd.DataFrame", scraped: dict) -> "pd.DataFrame":
+    """
+    For each row in df_recs, check if Recommended_Anchor exists in the
+    scraped content of Source_URL.
+    Adds columns: Anchor_In_Content, Content_Snippet, Content_Action.
+    """
+    if df_recs.empty or not scraped:
+        return df_recs
+    df = df_recs.copy()
+    found_list, snippet_list, action_list = [], [], []
+    for _, row in df.iterrows():
+        content = scraped.get(url_key(row["Source_URL"]), "")
+        if content:
+            found, snippet = find_anchor_in_content(row["Recommended_Anchor"], content)
+        else:
+            found, snippet = False, ""
+        found_list.append("✅ Oui" if found else "❌ Non")
+        snippet_list.append(snippet)
+        if found and row["Link_Exists"] == "✅ Oui":
+            action_list.append("✓ Déjà lié")
+        elif found:
+            action_list.append("🔗 Ajouter le lien sur l’ancre existante")
+        elif row["Link_Exists"] == "✅ Oui":
+            action_list.append("⚠️ Lien OK mais ancre différente dans le texte")
+        else:
+            action_list.append("✏️ Intégrer l’ancre + lien dans le contenu")
+    df["Anchor_In_Content"] = found_list
+    df["Content_Snippet"]   = snippet_list
+    df["Content_Action"]    = action_list
+    return df
 
 # ------------------------
 # Column Mapping
@@ -1046,7 +1160,20 @@ with col1:
 with col2:
     crawl_file = st.file_uploader("📄 Export Crawl (optionnel)", type=["csv", "xlsx", "xls"])
 
-with st.expander("📍 Import Keyword Mapping — Content Hub Builder (optionnel)", expanded=False):
+with st.expander("� Clé API Firecrawl (scraping de contenu)", expanded=False):
+    st.markdown("""
+    Optionnel — si renseignée, l’outil scrape le contenu de chaque page source pour détecter
+    si l’ancre recommandée est **déjà présente dans le texte** ou si elle doit y être ajoutée.
+    Sans clé, le fallback BeautifulSoup est utilisé (plus lent, moins précis).
+    """)
+    firecrawl_key_input = st.text_input(
+        "Firecrawl API Key", type="password",
+        value=_get_firecrawl_key(),
+        placeholder="fc-...",
+        key="firecrawl_key",
+    )
+
+with st.expander("�📍 Import Keyword Mapping — Content Hub Builder (optionnel)", expanded=False):
     st.markdown("""
     Upload ton mapping keyword au format **CSV ou Excel** avec les colonnes :
 
@@ -1096,6 +1223,9 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
             if mapping_rows:
                 df_mapping_recs = build_hub_recommendations(mapping_rows, results.get('df_content', pd.DataFrame()))
 
+            # Retrieve Firecrawl key (input field takes priority over secrets)
+            fc_key = st.session_state.get("firecrawl_key", "") or _get_firecrawl_key()
+
             tab_labels = ["🎯 Recommandations", "📊 Pages", "⚠️ Conflits", "🔗 Anchor Map", "📈 Charts", "🔍 Scope"]
             if mapping_rows:
                 tab_labels.insert(0, "🏗️ Content Hub")
@@ -1114,28 +1244,75 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
                     st.caption(f"{len(mapping_rows)} URLs dans le mapping · {sum(1 for r in mapping_rows if r['Role']=='HUB')} hubs · {sum(1 for r in mapping_rows if r['Role']=='SPOKE')} spokes")
 
                     if not df_mapping_recs.empty:
+                        # ── Content scraping section ────────────────────────────
+                        st.markdown("#### 🔍 Analyse du contenu des pages")
+                        scraped_cache = st.session_state.get("scraped_content", {})
+
+                        source_urls = df_mapping_recs["Source_URL"].dropna().unique().tolist()
+                        already_scraped = [u for u in source_urls if url_key(u) in scraped_cache]
+                        to_scrape = [u for u in source_urls if url_key(u) not in scraped_cache]
+
+                        sc1, sc2 = st.columns([3, 1])
+                        with sc1:
+                            st.caption(
+                                f"{len(source_urls)} pages sources · "
+                                f"{len(already_scraped)} déjà scrapées · "
+                                f"{len(to_scrape)} à scraper"
+                            )
+                        with sc2:
+                            do_scrape = st.button(
+                                f"🔍 Scraper {len(to_scrape)} page(s)",
+                                key="btn_scrape",
+                                disabled=len(to_scrape) == 0,
+                            )
+
+                        if do_scrape and to_scrape:
+                            prog = st.progress(0, text="Scraping en cours…")
+                            for i, url in enumerate(to_scrape):
+                                prog.progress((i + 1) / len(to_scrape), text=f"🔍 {url[:60]}…")
+                                text = scrape_page(url, api_key=fc_key)
+                                scraped_cache[url_key(url)] = text
+                                time.sleep(0.3)  # polite delay
+                            st.session_state["scraped_content"] = scraped_cache
+                            prog.empty()
+                            st.success(f"✅ {len(to_scrape)} pages scrapées")
+                            st.rerun()
+
+                        # Enrich recommendations if scraping data available
+                        if scraped_cache:
+                            df_mapping_recs = enrich_recommendations_with_content(df_mapping_recs, scraped_cache)
+
+                        st.markdown("---")
+
                         # Summary metrics
                         total_recs = len(df_mapping_recs)
                         missing = len(df_mapping_recs[df_mapping_recs['Link_Exists'] == '❌ Manquant'])
                         wrong_anchor = len(df_mapping_recs[df_mapping_recs['Anchor_OK'] == '⚠️ À corriger'])
                         ok = total_recs - missing - wrong_anchor
+                        anchors_in_content = len(df_mapping_recs[df_mapping_recs.get('Anchor_In_Content', pd.Series()) == '✅ Oui']) if 'Anchor_In_Content' in df_mapping_recs.columns else 0
 
-                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
                         with mc1: kpi_card("Liens à créer", str(missing), "liens manquants", "#DC2626")
                         with mc2: kpi_card("Ancres à corriger", str(wrong_anchor), "lien existe, mauvaise ancre", "#D97706")
                         with mc3: kpi_card("Liens OK", str(ok), "corrects", "#059669")
                         with mc4: kpi_card("Total checkés", str(total_recs), "paires source→cible")
+                        with mc5: kpi_card("Ancres dans texte", str(anchors_in_content) if scraped_cache else "—", "détectées via scraping", "#6D28D9")
 
                         st.markdown("---")
 
                         # Filters
-                        fc1, fc2, fc3 = st.columns(3)
+                        fc1, fc2, fc3, fc4 = st.columns(4)
                         with fc1:
-                            hub_filter = st.selectbox("Statut", ["Tous", "❌ Manquant", "⚠️ À corriger", "✅ OK"], key="hub_status")
+                            hub_filter = st.selectbox("Statut lien", ["Tous", "❌ Manquant", "⚠️ À corriger", "✅ OK"], key="hub_status")
                         with fc2:
                             type_filter_hub = st.selectbox("Type de lien", ["Tous", "HUB → SPOKE", "SPOKE → HUB", "SPOKE → SPOKE"], key="hub_type")
                         with fc3:
                             cluster_filter = st.selectbox("Cluster", ["Tous"] + sorted(set(r['Cluster'] for r in mapping_rows if r['Cluster'])), key="hub_cluster")
+                        with fc4:
+                            content_filter_opts = ["Tous"]
+                            if 'Anchor_In_Content' in df_mapping_recs.columns:
+                                content_filter_opts += ["✅ Ancre dans texte", "❌ Ancre absente"]
+                            content_filter = st.selectbox("Contenu", content_filter_opts, key="hub_content")
 
                         df_hub_display = df_mapping_recs.copy()
                         if hub_filter != "Tous":
@@ -1150,6 +1327,9 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
                         if cluster_filter != "Tous":
                             src_urls = {url_key(r['URL']) for r in mapping_rows if r['Cluster'] == cluster_filter}
                             df_hub_display = df_hub_display[df_hub_display['Source_URL'].apply(url_key).isin(src_urls) | df_hub_display['Target_URL'].apply(url_key).isin(src_urls)]
+                        if 'Anchor_In_Content' in df_hub_display.columns and content_filter != "Tous":
+                            val = '✅ Oui' if content_filter == '✅ Ancre dans texte' else '❌ Non'
+                            df_hub_display = df_hub_display[df_hub_display['Anchor_In_Content'] == val]
 
                         st.caption(f"{len(df_hub_display)} résultats affichés")
 
@@ -1160,6 +1340,22 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
                             for _, row in priority_rows.head(30).iterrows():
                                 status_color = "#FEE2E2" if row['Priority'] == 'HIGH' else "#FEF3C7"
                                 border_color = "#DC2626" if row['Priority'] == 'HIGH' else "#D97706"
+                                has_content  = 'Anchor_In_Content' in row.index
+                                in_content   = row.get('Anchor_In_Content', '') == '✅ Oui'
+                                snippet      = str(row.get('Content_Snippet', ''))
+                                action       = str(row.get('Content_Action', ''))
+                                content_html = ""
+                                if has_content:
+                                    ic_color  = "#059669" if in_content else "#DC2626"
+                                    ic_label  = "✅ Ancre détectée dans le texte" if in_content else "❌ Ancre absente du contenu"
+                                    snip_html = f'<div style="margin-top:4px; font-size:0.78em; color:#555; background:#f9f9f9; padding:6px 10px; border-radius:4px; font-style:italic;">{snippet}</div>' if snippet else ""
+                                    content_html = f"""
+                                        <div style="margin-top:8px; border-top:1px solid #e5e7eb; padding-top:8px;">
+                                            <span style="font-size:0.8em; font-weight:700; color:{ic_color};">{ic_label}</span>
+                                            {snip_html}
+                                            <div style="margin-top:4px; font-size:0.78em; font-weight:600; color:#374151;">📌 Action : {action}</div>
+                                        </div>
+                                    """
                                 st.markdown(f"""
                                 <div style="background:{status_color}; border-left:4px solid {border_color}; border-radius:8px; padding:12px 16px; margin-bottom:10px;">
                                     <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
@@ -1183,15 +1379,18 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
                                         <code style="color:#059669; font-weight:700;">{row['Recommended_Anchor']}</code>
                                         {'<span style="color:#D97706; margin-left:12px;">Ancre actuelle : <em>' + row['Current_Anchor'] + '</em></span>' if row['Current_Anchor'] else ''}
                                     </div>
+                                    {content_html}
                                     <div style="margin-top:4px; font-size:0.75em; color:#666;">ℹ️ {row['Reason']}</div>
                                 </div>
                                 """, unsafe_allow_html=True)
 
                         st.markdown("---")
-                        st.markdown("### � Tableau complet")
+                        st.markdown("### 📋 Tableau complet")
+                        base_cols = ['Type', 'Source_URL', 'Source_Role', 'Target_URL', 'Target_Role',
+                                     'Recommended_Anchor', 'Current_Anchor', 'Link_Exists', 'Anchor_OK', 'Priority', 'Reason']
+                        extra_cols = [c for c in ['Anchor_In_Content', 'Content_Action', 'Content_Snippet'] if c in df_hub_display.columns]
                         st.dataframe(
-                            df_hub_display[['Type', 'Source_URL', 'Source_Role', 'Target_URL', 'Target_Role',
-                                           'Recommended_Anchor', 'Current_Anchor', 'Link_Exists', 'Anchor_OK', 'Priority', 'Reason']],
+                            df_hub_display[base_cols + extra_cols],
                             use_container_width=True, hide_index=True, height=400
                         )
 
