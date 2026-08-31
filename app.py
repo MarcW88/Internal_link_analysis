@@ -746,6 +746,7 @@ def process_files(inlinks_file, crawl_file=None, target_domain=None, target_lang
         'recommendations': df_recommendations,
         'crawl_data': crawl_data,
         'page_analysis': page_analysis,
+        'df_content': df_content,
         'position_breakdown': {
             'Content': len(df_content),
             'Navigation': len(df_nav),
@@ -830,6 +831,205 @@ def plot_score_distribution(df_pages):
 
 
 # ------------------------
+# Keyword Mapping Engine
+# ------------------------
+
+def parse_mapping(mapping_file):
+    """
+    Parse a keyword mapping CSV/Excel.
+    Expected columns (flexible):
+      URL | Keyword (primary) | Role (Hub/Spoke/Pillar/Article) | Hub_URL (optional)
+    Returns a list of dicts.
+    """
+    if mapping_file is None:
+        return []
+    df = read_file(mapping_file)
+    if df is None or df.empty:
+        return []
+    df.columns = df.columns.str.strip()
+
+    # Flexible column detection
+    col_map = {}
+    for col in df.columns:
+        cl = col.lower().strip()
+        if cl in ('url', 'adresse', 'address', 'page', 'page url', 'lien', 'link'):
+            col_map['URL'] = col
+        elif cl in ('keyword', 'mot-clé', 'mot cle', 'primary keyword', 'mot-clé principal',
+                    'kw', 'cible', 'target keyword', 'ancre recommandée', 'ancre'):
+            col_map['Keyword'] = col
+        elif cl in ('role', 'rôle', 'type', 'page type', 'page role', 'niveau', 'level',
+                    'hub', 'catégorie', 'category', 'cluster'):
+            col_map['Role'] = col
+        elif cl in ('hub_url', 'hub url', 'parent', 'parent url', 'pillar url',
+                    'hub', 'pilier', 'parent page'):
+            col_map['Hub_URL'] = col
+        elif cl in ('secondary keyword', 'mot-clé secondaire', 'secondary', 'kw2', 'ancre 2'):
+            col_map['Keyword2'] = col
+        elif cl in ('cluster', 'groupe', 'group', 'thématique', 'thematique', 'topic'):
+            col_map['Cluster'] = col
+
+    if 'URL' not in col_map:
+        # Try first column as URL fallback
+        col_map['URL'] = df.columns[0]
+    if 'Keyword' not in col_map and len(df.columns) > 1:
+        col_map['Keyword'] = df.columns[1]
+
+    rows = []
+    for _, r in df.iterrows():
+        url = normalize_url(to_text(r.get(col_map.get('URL', ''), '')))
+        if not url:
+            continue
+        keyword = to_text(r.get(col_map.get('Keyword', ''), ''))
+        role = to_text(r.get(col_map.get('Role', ''), '')).upper()
+        hub_url = normalize_url(to_text(r.get(col_map.get('Hub_URL', ''), '')))
+        keyword2 = to_text(r.get(col_map.get('Keyword2', ''), ''))
+        cluster = to_text(r.get(col_map.get('Cluster', ''), ''))
+
+        # Normalize role
+        if any(x in role for x in ('HUB', 'PILIER', 'PILLAR', 'CLUSTER', 'CATEGOR')):
+            role = 'HUB'
+        elif any(x in role for x in ('SPOKE', 'ARTICLE', 'SOUS', 'CHILD', 'DETAIL', 'BLOG')):
+            role = 'SPOKE'
+        else:
+            role = role or 'SPOKE'
+
+        rows.append({
+            'URL': url,
+            'Keyword': keyword,
+            'Keyword2': keyword2,
+            'Role': role,
+            'Hub_URL': hub_url,
+            'Cluster': cluster,
+        })
+
+    return rows
+
+
+def build_hub_recommendations(mapping_rows, existing_links_df):
+    """
+    Given the keyword mapping and the existing inlinks dataframe,
+    generate anchor recommendations for all missing hub<->spoke links.
+
+    Logic:
+    - Hub → Spoke:  hub page should link to each spoke using spoke’s keyword as anchor
+    - Spoke → Hub:  each spoke should link back to its hub using hub’s keyword as anchor
+    - Spoke → Spoke (same hub): cross-linking within same cluster
+    """
+    if not mapping_rows:
+        return pd.DataFrame()
+
+    # Build fast lookup: url_key -> mapping row
+    url_to_map = {url_key(r['URL']): r for r in mapping_rows if r['URL']}
+    keyword_of = {url_key(r['URL']): r['Keyword'] for r in mapping_rows if r['URL']}
+    role_of = {url_key(r['URL']): r['Role'] for r in mapping_rows if r['URL']}
+    cluster_of = {url_key(r['URL']): r['Cluster'] for r in mapping_rows if r['URL']}
+
+    # Build existing links set: (from_key, to_key) -> anchor
+    existing = set()
+    anchor_existing = {}
+    if not existing_links_df.empty and 'From' in existing_links_df.columns and 'To' in existing_links_df.columns:
+        for _, row in existing_links_df.iterrows():
+            fk = url_key(row['From'])
+            tk = url_key(row['To'])
+            existing.add((fk, tk))
+            anchor_existing[(fk, tk)] = to_text(row.get('Anchor', ''))
+
+    # Group spokes by their hub
+    hub_spokes = {}  # hub_key -> [spoke row]
+    for r in mapping_rows:
+        hub_k = url_key(r['Hub_URL']) if r['Hub_URL'] else None
+        self_k = url_key(r['URL'])
+        if r['Role'] == 'HUB':
+            if self_k not in hub_spokes:
+                hub_spokes[self_k] = []
+        if hub_k and hub_k != self_k:
+            hub_spokes.setdefault(hub_k, []).append(r)
+
+    # Also group by cluster name for cross-spoke recommendations
+    cluster_groups = {}
+    for r in mapping_rows:
+        cl = r['Cluster'] or r.get('Hub_URL', '')
+        if cl:
+            cluster_groups.setdefault(cl, []).append(r)
+
+    recommendations = []
+
+    def add_rec(source_url, target_url, anchor, link_type, reason):
+        fk = url_key(source_url)
+        tk = url_key(target_url)
+        already = (fk, tk) in existing
+        current_anchor = anchor_existing.get((fk, tk), '') if already else ''
+        anchor_ok = current_anchor.lower().strip() == anchor.lower().strip() if already else False
+        recommendations.append({
+            'Type': link_type,
+            'Source_URL': source_url,
+            'Source_Role': role_of.get(fk, ''),
+            'Target_URL': target_url,
+            'Target_Role': role_of.get(tk, ''),
+            'Recommended_Anchor': anchor,
+            'Current_Anchor': current_anchor,
+            'Link_Exists': '✅ Oui' if already else '❌ Manquant',
+            'Anchor_OK': '✅ OK' if (already and anchor_ok) else ('⚠️ À corriger' if already else '—'),
+            'Priority': 'OK' if (already and anchor_ok) else ('HIGH' if not already else 'MEDIUM'),
+            'Reason': reason,
+        })
+
+    # 1. Hub → each of its spokes
+    for hub_k, spokes in hub_spokes.items():
+        hub_map = url_to_map.get(hub_k)
+        if not hub_map:
+            continue
+        hub_url = hub_map['URL']
+        for spoke in spokes:
+            anchor = spoke['Keyword'] or spoke['URL'].split('/')[-1]
+            add_rec(
+                source_url=hub_url,
+                target_url=spoke['URL'],
+                anchor=anchor,
+                link_type='HUB → SPOKE',
+                reason=f"Le hub doit linker vers ce spoke avec l'ancre exacte du mot-clé cible",
+            )
+
+    # 2. Spoke → its Hub (back-link)
+    for r in mapping_rows:
+        if r['Role'] == 'SPOKE' and r['Hub_URL']:
+            hub_k = url_key(r['Hub_URL'])
+            hub_map = url_to_map.get(hub_k)
+            hub_anchor = keyword_of.get(hub_k, '') or (hub_map['URL'].split('/')[-1] if hub_map else '')
+            if hub_map:
+                add_rec(
+                    source_url=r['URL'],
+                    target_url=hub_map['URL'],
+                    anchor=hub_anchor,
+                    link_type='SPOKE → HUB',
+                    reason="Le spoke doit linker vers son hub (signal thématique)",
+                )
+
+    # 3. Cross-spokes within same cluster (top semantic neighbors only)
+    for cl, pages in cluster_groups.items():
+        spokes = [p for p in pages if p['Role'] == 'SPOKE']
+        for i, src in enumerate(spokes):
+            for tgt in spokes[i+1:i+4]:  # max 3 cross-links per spoke
+                if url_key(src['URL']) == url_key(tgt['URL']):
+                    continue
+                anchor = tgt['Keyword'] or tgt['URL'].split('/')[-1]
+                add_rec(
+                    source_url=src['URL'],
+                    target_url=tgt['URL'],
+                    anchor=anchor,
+                    link_type='SPOKE → SPOKE',
+                    reason=f"Maill. croisé au sein du cluster \u00ab{cl}\u00bb",
+                )
+
+    df_rec = pd.DataFrame(recommendations)
+    if not df_rec.empty:
+        priority_order = {'HIGH': 0, 'MEDIUM': 1, 'OK': 2}
+        df_rec['_prio_n'] = df_rec['Priority'].map(priority_order)
+        df_rec = df_rec.sort_values(['_prio_n', 'Type']).drop(columns=['_prio_n'])
+    return df_rec
+
+
+# ------------------------
 # Main UI
 # ------------------------
 
@@ -845,6 +1045,22 @@ with col1:
     inlinks_file = st.file_uploader("📄 Export Inlinks Screaming Frog", type=["csv", "xlsx", "xls"])
 with col2:
     crawl_file = st.file_uploader("📄 Export Crawl (optionnel)", type=["csv", "xlsx", "xls"])
+
+with st.expander("📍 Import Keyword Mapping — Content Hub Builder (optionnel)", expanded=False):
+    st.markdown("""
+    Upload ton mapping keyword au format **CSV ou Excel** avec les colonnes :
+
+    | URL | Keyword | Role | Hub_URL | Cluster |
+    |---|---|---|---|---|
+    | /seo-local | séo local | SPOKE | /seo | Local |
+    | /seo | référencement naturel | HUB | | Local |
+
+    - **Role** : `HUB` (pilier / catégorie) ou `SPOKE` (article / sous-page)
+    - **Keyword** : le mot-clé cible principal — ce sera l’ancre recommandée
+    - **Hub_URL** : URL du hub parent pour chaque spoke
+    - **Cluster** : nom du cluster thématique (pour le maillage croisé entre spokes)
+    """, unsafe_allow_html=True)
+    mapping_file = st.file_uploader("📄 Keyword Mapping (CSV / Excel)", type=["csv", "xlsx", "xls"], key="mapping")
 
 # Domain and language filters
 target_domain = st.text_input("🌐 Domaine cible (auto-détecté si vide)", placeholder="example.com")
@@ -874,10 +1090,122 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
             st.caption(f"Analysé le {datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')}")
             
             # Tabs
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-                "🎯 Recommandations", "📊 Pages", "⚠️ Conflits", "🔗 Anchor Map", "📈 Charts", "🔍 Scope"
-            ])
+            # Parse mapping if uploaded
+            mapping_rows = parse_mapping(mapping_file)
+            df_mapping_recs = pd.DataFrame()
+            if mapping_rows:
+                df_mapping_recs = build_hub_recommendations(mapping_rows, results.get('df_content', pd.DataFrame()))
+
+            tab_labels = ["🎯 Recommandations", "📊 Pages", "⚠️ Conflits", "🔗 Anchor Map", "📈 Charts", "🔍 Scope"]
+            if mapping_rows:
+                tab_labels.insert(0, "🏗️ Content Hub")
+            tabs = st.tabs(tab_labels)
+
+            hub_tab_offset = 1 if mapping_rows else 0
+            if mapping_rows:
+                tab_hub = tabs[0]
+                tab1, tab2, tab3, tab4, tab5, tab6 = tabs[1], tabs[2], tabs[3], tabs[4], tabs[5], tabs[6]
+            else:
+                tab1, tab2, tab3, tab4, tab5, tab6 = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5]
             
+            if mapping_rows:
+                with tab_hub:
+                    st.subheader("�️ Content Hub — Recommandations de maillage sur ancres")
+                    st.caption(f"{len(mapping_rows)} URLs dans le mapping · {sum(1 for r in mapping_rows if r['Role']=='HUB')} hubs · {sum(1 for r in mapping_rows if r['Role']=='SPOKE')} spokes")
+
+                    if not df_mapping_recs.empty:
+                        # Summary metrics
+                        total_recs = len(df_mapping_recs)
+                        missing = len(df_mapping_recs[df_mapping_recs['Link_Exists'] == '❌ Manquant'])
+                        wrong_anchor = len(df_mapping_recs[df_mapping_recs['Anchor_OK'] == '⚠️ À corriger'])
+                        ok = total_recs - missing - wrong_anchor
+
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        with mc1: kpi_card("Liens à créer", str(missing), "liens manquants", "#DC2626")
+                        with mc2: kpi_card("Ancres à corriger", str(wrong_anchor), "lien existe, mauvaise ancre", "#D97706")
+                        with mc3: kpi_card("Liens OK", str(ok), "corrects", "#059669")
+                        with mc4: kpi_card("Total checkés", str(total_recs), "paires source→cible")
+
+                        st.markdown("---")
+
+                        # Filters
+                        fc1, fc2, fc3 = st.columns(3)
+                        with fc1:
+                            hub_filter = st.selectbox("Statut", ["Tous", "❌ Manquant", "⚠️ À corriger", "✅ OK"], key="hub_status")
+                        with fc2:
+                            type_filter_hub = st.selectbox("Type de lien", ["Tous", "HUB → SPOKE", "SPOKE → HUB", "SPOKE → SPOKE"], key="hub_type")
+                        with fc3:
+                            cluster_filter = st.selectbox("Cluster", ["Tous"] + sorted(set(r['Cluster'] for r in mapping_rows if r['Cluster'])), key="hub_cluster")
+
+                        df_hub_display = df_mapping_recs.copy()
+                        if hub_filter != "Tous":
+                            if hub_filter == "✅ OK":
+                                df_hub_display = df_hub_display[df_hub_display['Priority'] == 'OK']
+                            elif hub_filter == "❌ Manquant":
+                                df_hub_display = df_hub_display[df_hub_display['Link_Exists'] == '❌ Manquant']
+                            elif hub_filter == "⚠️ À corriger":
+                                df_hub_display = df_hub_display[df_hub_display['Anchor_OK'] == '⚠️ À corriger']
+                        if type_filter_hub != "Tous":
+                            df_hub_display = df_hub_display[df_hub_display['Type'] == type_filter_hub]
+                        if cluster_filter != "Tous":
+                            src_urls = {url_key(r['URL']) for r in mapping_rows if r['Cluster'] == cluster_filter}
+                            df_hub_display = df_hub_display[df_hub_display['Source_URL'].apply(url_key).isin(src_urls) | df_hub_display['Target_URL'].apply(url_key).isin(src_urls)]
+
+                        st.caption(f"{len(df_hub_display)} résultats affichés")
+
+                        # Card view for missing/to-fix
+                        priority_rows = df_hub_display[df_hub_display['Priority'].isin(['HIGH', 'MEDIUM'])]
+                        if not priority_rows.empty:
+                            st.markdown("### ⚡ Actions prioritaires")
+                            for _, row in priority_rows.head(30).iterrows():
+                                status_color = "#FEE2E2" if row['Priority'] == 'HIGH' else "#FEF3C7"
+                                border_color = "#DC2626" if row['Priority'] == 'HIGH' else "#D97706"
+                                st.markdown(f"""
+                                <div style="background:{status_color}; border-left:4px solid {border_color}; border-radius:8px; padding:12px 16px; margin-bottom:10px;">
+                                    <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                                        <span style="font-size:0.8em; font-weight:700; color:{border_color};">{row['Type']} — {row['Link_Exists']}</span>
+                                        <span style="font-size:0.8em; background:#fff; padding:2px 8px; border-radius:4px;">{row['Anchor_OK']}</span>
+                                    </div>
+                                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+                                        <div>
+                                            <span style="font-size:0.75em; color:#666;">SOURCE</span><br/>
+                                            <code style="font-size:0.8em;">{row['Source_URL']}</code>
+                                            <span style="font-size:0.75em; color:#888;"> ({row['Source_Role']})</span>
+                                        </div>
+                                        <div>
+                                            <span style="font-size:0.75em; color:#666;">CIBLE</span><br/>
+                                            <code style="font-size:0.8em;">{row['Target_URL']}</code>
+                                            <span style="font-size:0.75em; color:#888;"> ({row['Target_Role']})</span>
+                                        </div>
+                                    </div>
+                                    <div style="margin-top:8px; background:#fff; padding:6px 10px; border-radius:6px;">
+                                        🏷️ <strong>Ancre recommandée :</strong>
+                                        <code style="color:#059669; font-weight:700;">{row['Recommended_Anchor']}</code>
+                                        {'<span style="color:#D97706; margin-left:12px;">Ancre actuelle : <em>' + row['Current_Anchor'] + '</em></span>' if row['Current_Anchor'] else ''}
+                                    </div>
+                                    <div style="margin-top:4px; font-size:0.75em; color:#666;">ℹ️ {row['Reason']}</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                        st.markdown("---")
+                        st.markdown("### � Tableau complet")
+                        st.dataframe(
+                            df_hub_display[['Type', 'Source_URL', 'Source_Role', 'Target_URL', 'Target_Role',
+                                           'Recommended_Anchor', 'Current_Anchor', 'Link_Exists', 'Anchor_OK', 'Priority', 'Reason']],
+                            use_container_width=True, hide_index=True, height=400
+                        )
+
+                        # CSV export
+                        csv_hub = df_hub_display.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            label="⬇️ Télécharger les recommandations (CSV)",
+                            data=csv_hub,
+                            file_name="hub_anchor_recommendations.csv",
+                            mime="text/csv",
+                        )
+                    else:
+                        st.info("💡 Le mapping a été chargé mais aucune recommandation n'a pu être générée.\nVérifie que les colonnes URL, Keyword, Role et Hub_URL sont bien renseignées.")
+
             with tab1:
                 st.subheader("🎯 Recommandations intelligentes")
                 if not results['recommendations'].empty:
@@ -1020,7 +1348,7 @@ if st.button("🔍 Analyser", use_container_width=True, type="primary"):
                 **Lignes exclues:** {results['scope']['total'] - results['scope']['kept']:,}
                 """)
                 
-                if results['scope']['excluded']:
+                if results.get('scope', {}).get('excluded'):
                     st.markdown("**Détail des exclusions:**")
                     for reason, count in results['scope']['excluded'].items():
                         if count > 0:
