@@ -60,8 +60,8 @@ export function Analyzer() {
     setLoading(true); setProgress(2); setStatus("Préparation de l’analyse…"); setError(""); setResult(null);
     let timer: number | undefined;
     try {
-      setProgress(10); setStatus("Analyse du graphe et exclusion des liens existants…");
-      timer = window.setInterval(() => setProgress((current) => Math.min(current + 1, 94)), 1200);
+      setProgress(10); setStatus("Analyse du graphe et scoring…");
+      timer = window.setInterval(() => setProgress((current) => Math.min(current + 1, 99)), 1500);
       const targetUrls = target.split(/[\n,]+/).map((url) => url.trim()).filter(Boolean);
       const response = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ inlinksUrl: inlinks.url, crawlUrl: crawl.url, targetUrls: targetUrls.length ? targetUrls : undefined, mappingUrl: mapping.url || undefined }) });
       setStatus("Finalisation des recommandations…");

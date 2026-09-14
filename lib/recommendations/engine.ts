@@ -279,10 +279,14 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
 
   let pageEmbeddings: EmbeddingMap = new Map();
   let embeddingError = "";
-  try {
-    pageEmbeddings = await embedPages(pageUrls, pageTexts);
-  } catch (error) {
-    embeddingError = error instanceof Error ? error.message : "Embeddings non disponibles";
+  if (targets?.length) {
+    embeddingError = "Embeddings désactivés en mode URL cible pour accélérer l’analyse";
+  } else {
+    try {
+      pageEmbeddings = await embedPages(pageUrls, pageTexts);
+    } catch (error) {
+      embeddingError = error instanceof Error ? error.message : "Embeddings non disponibles";
+    }
   }
 
   const keywordCannibals: { keyword: string; urls: string[] }[] = [];
@@ -456,38 +460,44 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   const scrapeErrors = new Set<string>();
   const sourceBlocks = new Map<string, ContentBlock[]>();
 
-  for (const rec of rawRecommendations.slice(0, 15)) {
-    const target = pageAnalysis.get(rec.target)!;
+  const topRecs = rawRecommendations.slice(0, 12);
+  const uniqueSources = [...new Set(topRecs.map((r) => r.source))];
+  await Promise.all(uniqueSources.map(async (source) => {
     try {
-      let blocks = sourceBlocks.get(rec.source);
-      if (!blocks) {
-        blocks = extractContentBlocks(await readWithJina(rec.source));
-        sourceBlocks.set(rec.source, blocks);
-        scrapedPages += 1;
-      }
-      const selected = selectExistingAnchor(blocks, { title: target.title || target.h1, keyword: rec.anchorHint || target.h1 });
-      if (!selected) {
-        passagesWithoutAnchor += 1;
-        const fallbackAnchor = rec.anchorHint || target.h1 || target.title;
-        if (fallbackAnchor) {
-          recommendations.push({ source: rec.source, target: rec.target, anchor: fallbackAnchor, passage: rec.reasons.join(" | "), score: rec.score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
-        }
-        continue;
-      }
-      const normalized = selected.anchor.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
-      const targetsForAnchor = targetsByAnchor.get(normalized);
-      const conflict = Boolean(targetsForAnchor && [...targetsForAnchor].some((url) => url !== rec.target));
-      if (conflict) continue;
-      const score = Math.round(rec.score * 0.55 + (selected.quality / 100) * 45);
-      recommendations.push({ source: rec.source, target: rec.target, anchor: selected.anchor, passage: selected.passage, score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
+      sourceBlocks.set(source, extractContentBlocks(await readWithJina(source)));
+      scrapedPages += 1;
     } catch (error) {
       scrapeFailures += 1;
       scrapeErrors.add(error instanceof Error ? error.message : "Scraping impossible");
+      sourceBlocks.set(source, []);
+    }
+  }));
+
+  for (const rec of topRecs) {
+    const target = pageAnalysis.get(rec.target)!;
+    const blocks = sourceBlocks.get(rec.source);
+    if (!blocks || !blocks.length) {
       const fallbackAnchor = rec.anchorHint || target.h1 || target.title;
       if (fallbackAnchor) {
         recommendations.push({ source: rec.source, target: rec.target, anchor: fallbackAnchor, passage: rec.reasons.join(" | "), score: rec.score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
       }
+      continue;
     }
+    const selected = selectExistingAnchor(blocks, { title: target.title || target.h1, keyword: rec.anchorHint || target.h1 });
+    if (!selected) {
+      passagesWithoutAnchor += 1;
+      const fallbackAnchor = rec.anchorHint || target.h1 || target.title;
+      if (fallbackAnchor) {
+        recommendations.push({ source: rec.source, target: rec.target, anchor: fallbackAnchor, passage: rec.reasons.join(" | "), score: rec.score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
+      }
+      continue;
+    }
+    const normalized = selected.anchor.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+    const targetsForAnchor = targetsByAnchor.get(normalized);
+    const conflict = Boolean(targetsForAnchor && [...targetsForAnchor].some((url) => url !== rec.target));
+    if (conflict) continue;
+    const score = Math.round(rec.score * 0.55 + (selected.quality / 100) * 45);
+    recommendations.push({ source: rec.source, target: rec.target, anchor: selected.anchor, passage: selected.passage, score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
   }
 
   const excludedPages = [...pageAnalysis.values()].filter((p) => !p.indexable).length;
