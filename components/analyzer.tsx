@@ -1,14 +1,21 @@
 'use client';
 
 import { upload } from "@vercel/blob/client";
-import { useState, type ChangeEvent } from "react";
+import { useState, useEffect, useRef, type ChangeEvent } from "react";
 
 type Cannibal = { type: string; label: string; urls: string[]; score: number };
-type Result = {
-  summary: { pages: number; links: number; contextualLinks: number; excludedPages: number; conflicts: number; cannibalization: number; recommendations: number };
-  conflicts: { anchor: string; targets: string[] }[];
-  cannibalization: Cannibal[];
-  recommendations: { source: string; target: string; anchor: string; passage: string; score: number; direction?: string }[];
+type Recommendation = { source: string; target: string; anchor: string; passage: string; score: number; direction?: string };
+
+type RunState = {
+  status: "pending" | "preparing" | "enriching" | "done" | "not_found" | "error";
+  phase?: string;
+  progress?: number;
+  summary?: Record<string, number>;
+  raw?: { source: string; target: string; score: number; reasons: string[]; type: string }[];
+  recommendations?: Recommendation[];
+  conflicts?: { anchor: string; targets: string[] }[];
+  cannibalization?: Cannibal[];
+  scrapeErrors?: string[];
 };
 
 type FileState = {
@@ -19,7 +26,7 @@ type FileState = {
 };
 
 export function Analyzer() {
-  const [result, setResult] = useState<Result | null>(null);
+  const [result, setResult] = useState<RunState | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -29,6 +36,8 @@ export function Analyzer() {
   const [crawl, setCrawl] = useState<FileState>({ file: null, url: "", state: "idle", message: "" });
   const [mapping, setMapping] = useState<FileState>({ file: null, url: "", state: "idle", message: "" });
   const [target, setTarget] = useState("");
+
+  const pollRef = useRef<number | null>(null);
 
   async function uploadCsv(file: File, setFile: (value: FileState) => void) {
     setFile({ file, url: "", state: "uploading", message: "Chargement…" });
@@ -55,25 +64,90 @@ export function Analyzer() {
     if (file) uploadCsv(file, setMapping);
   }
 
-  async function analyze() {
-    if (!inlinks.url || !crawl.url) return;
-    setLoading(true); setProgress(2); setStatus("Préparation de l’analyse…"); setError(""); setResult(null);
-    let timer: number | undefined;
-    try {
-      setProgress(10); setStatus("Analyse du graphe et scoring…");
-      timer = window.setInterval(() => setProgress((current) => Math.min(current + 1, 99)), 1500);
-      const targetUrls = target.split(/[\n,]+/).map((url) => url.trim()).filter(Boolean);
-      const response = await fetch("/api/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ inlinksUrl: inlinks.url, crawlUrl: crawl.url, targetUrls: targetUrls.length ? targetUrls : undefined, mappingUrl: mapping.url || undefined }) });
-      setStatus("Finalisation des recommandations…");
-      const text = await response.text();
-      const data = text.startsWith("{") ? JSON.parse(text) : { error: text || `Erreur HTTP ${response.status}` };
-      if (!response.ok) throw new Error(data.error ?? "Analyse impossible");
-      setProgress(100); setStatus("Analyse terminée"); setResult(data);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Analyse impossible"); setStatus("Analyse interrompue"); }
-    finally { if (timer) window.clearInterval(timer); setLoading(false); }
+  function stopPolling() {
+    if (pollRef.current) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
   }
 
+  function updateProgress(state: RunState) {
+    switch (state.status) {
+      case "pending": setProgress(5); setStatus("Démarrage du moteur…"); break;
+      case "preparing":
+        setProgress(20);
+        setStatus(`Préparation du graphe — ${state.summary?.pages ?? "—"} pages modélisées`);
+        break;
+      case "enriching":
+      case "done":
+        setProgress(100);
+        setStatus("Analyse terminée");
+        break;
+      default:
+        setProgress(0);
+        setStatus("");
+    }
+  }
+
+  async function poll(runId: string) {
+    try {
+      const response = await fetch(`/api/analyses/${runId}`);
+      if (!response.ok) throw new Error("Statut introuvable");
+      const state = (await response.json()) as RunState;
+      setResult(state);
+      updateProgress(state);
+
+      if (state.status === "done" || state.status === "error" || state.status === "not_found") {
+        stopPolling();
+        setLoading(false);
+        if (state.status === "error" || state.status === "not_found") {
+          setError(state.phase || "Analyse interrompue");
+        }
+      }
+    } catch (cause) {
+      stopPolling();
+      setLoading(false);
+      setError(cause instanceof Error ? cause.message : "Erreur de suivi");
+    }
+  }
+
+  async function analyze() {
+    if (!inlinks.url || !crawl.url) return;
+    stopPolling();
+    setLoading(true);
+    setError("");
+    setResult(null);
+    setProgress(2);
+    setStatus("Envoi des fichiers…");
+
+    try {
+      const targetUrls = target.split(/[\n,]+/).map((url) => url.trim()).filter(Boolean);
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ inlinksUrl: inlinks.url, crawlUrl: crawl.url, targetUrls: targetUrls.length ? targetUrls : undefined, mappingUrl: mapping.url || undefined }),
+      });
+      const data = (await response.json()) as { runId?: string; error?: string };
+      if (!response.ok || !data.runId) throw new Error(data.error ?? "Analyse impossible");
+
+      const runId = data.runId;
+      setStatus("Analyse lancée — récupération du statut…");
+      await poll(runId);
+      pollRef.current = window.setInterval(() => poll(runId), 3000);
+    } catch (cause) {
+      setLoading(false);
+      setError(cause instanceof Error ? cause.message : "Analyse impossible");
+    }
+  }
+
+  useEffect(() => () => stopPolling(), []);
+
   const canAnalyze = inlinks.state === "complete" && crawl.state === "complete" && (mapping.state === "idle" || mapping.state === "complete");
+
+  const summary = result?.summary;
+  const recommendations = result?.recommendations || [];
+  const conflicts = result?.conflicts || [];
+  const cannibalization = result?.cannibalization || [];
 
   return <>
     <div className="uploadPanel">
@@ -102,22 +176,31 @@ export function Analyzer() {
     {(loading || progress > 0) && <div className="progressPanel" aria-live="polite">
       <div className="progressMeta"><b>{status}</b><span>{progress}%</span></div>
       <div className="progressTrack" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><div style={{ width: `${progress}%` }} /></div>
-      {loading && <small>Le scraping Jina peut prendre plusieurs minutes selon le nombre de pages candidates.</small>}
+      {loading && <small>L’analyse est maintenant exécutée en arrière-plan. Les recommandations apparaissent au fur et à mesure.</small>}
     </div>}
     {error && <div className="error">{error}</div>}
     {!result && !error && !loading && progress === 0 && <div className="empty"><b>Sélectionne les deux CSV</b><p>Le mapping HUB/SPOKE est optionnel. Le bouton d’analyse devient actif quand les fichiers requis sont chargés.</p></div>}
-    {result && <>
+
+    {result && result.status !== "done" && (
+      <div className="panel">
+        <div className="panelHeader"><div><p className="eyebrow">En cours</p><h2>{result.phase ?? result.status}</h2></div></div>
+        {result.raw && <p>{result.raw.length} opportunités identifiées, enrichissement en attente…</p>}
+        {result.scrapeErrors && result.scrapeErrors.length > 0 && <div className="error"><b>Erreurs de scraping :</b> {result.scrapeErrors.length}</div>}
+      </div>
+    )}
+
+    {result && result.status === "done" && summary && <>
       <div className="metrics">
-        {Object.entries(result.summary).map(([label, value]) => <article key={label}><p>{label.replace(/([A-Z])/g, " $1")}</p><strong>{value}</strong></article>)}
+        {Object.entries(summary).map(([label, value]) => <article key={label}><p>{label.replace(/([A-Z])/g, " $1")}</p><strong>{value}</strong></article>)}
       </div>
       <div className="panel">
-        <div className="panelHeader"><div><p className="eyebrow">Résultats réels</p><h2>Liens internes recommandés</h2></div><span>{result.recommendations.length} opportunités</span></div>
+        <div className="panelHeader"><div><p className="eyebrow">Résultats réels</p><h2>Liens internes recommandés</h2></div><span>{recommendations.length} opportunités</span></div>
         <div className="row head"><span>Source → cible</span><span>Ancre et passage</span><span>Score</span></div>
-        {result.recommendations.map((item) => <div className="row" key={`${item.source}|${item.target}|${item.anchor}`}><span><b>{item.source}</b><small>→ {item.target}</small></span><span><b>{item.anchor}</b><small>{item.passage.slice(0, 180)}…</small></span><span><em>{item.score}</em><small>{item.direction === "outgoing" ? "lien sortant" : "lien entrant"}</small></span></div>)}
-        {!result.recommendations.length && <div className="empty">Aucune opportunité fiable trouvée après exclusions.</div>}
+        {recommendations.map((item) => <div className="row" key={`${item.source}|${item.target}|${item.anchor}`}><span><b>{item.source}</b><small>→ {item.target}</small></span><span><b>{item.anchor}</b><small>{item.passage?.slice(0, 180)}…</small></span><span><em>{item.score}</em><small>{item.direction === "outgoing" ? "lien sortant" : "lien entrant"}</small></span></div>)}
+        {!recommendations.length && <div className="empty">Aucune opportunité fiable trouvée après exclusions.</div>}
       </div>
-      {result.conflicts.length > 0 && <div className="panel conflicts"><div className="panelHeader"><div><p className="eyebrow">Contrôle</p><h2>Conflits d’ancres existants</h2></div></div>{result.conflicts.slice(0, 50).map((item) => <div className="conflict" key={item.anchor}><b>{item.anchor}</b><span>{item.targets.join(" · ")}</span></div>)}</div>}
-      {result.cannibalization.length > 0 && <div className="panel cannibalization"><div className="panelHeader"><div><p className="eyebrow">Contrôle</p><h2>Cannibalisation sémantique</h2></div></div>{result.cannibalization.slice(0, 50).map((item) => <div className="conflict" key={`${item.type}|${item.label}`}><b>{item.type.toUpperCase()}</b><span>{item.label}</span><span>{item.urls.join(" · ")}</span></div>)}</div>}
+      {conflicts.length > 0 && <div className="panel conflicts"><div className="panelHeader"><div><p className="eyebrow">Contrôle</p><h2>Conflits d’ancres existants</h2></div></div>{conflicts.slice(0, 50).map((item) => <div className="conflict" key={item.anchor}><b>{item.anchor}</b><span>{item.targets.join(" · ")}</span></div>)}</div>}
+      {cannibalization.length > 0 && <div className="panel cannibalization"><div className="panelHeader"><div><p className="eyebrow">Contrôle</p><h2>Cannibalisation sémantique</h2></div></div>{cannibalization.slice(0, 50).map((item) => <div className="conflict" key={`${item.type}|${item.label}`}><b>{item.type.toUpperCase()}</b><span>{item.label}</span><span>{item.urls.join(" · ")}</span></div>)}</div>}
     </>}
   </>;
 }

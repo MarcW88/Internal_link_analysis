@@ -1,3 +1,7 @@
+import { get } from "@vercel/blob";
+import { parseCsv } from "@/lib/ingest/csv";
+import { parseMapping } from "@/lib/ingest/mapping";
+import { buildResult, enrichRecommendation, prepareCrawl, type Prepared, type RawRec } from "@/lib/recommendations/workflow-engine";
 import { saveRunState } from "@/lib/analysis/state";
 
 type AnalyzeArgs = {
@@ -8,69 +12,58 @@ type AnalyzeArgs = {
   runId: string;
 };
 
-type Prepared = {
-  status: "preparing";
-  runId: string;
-  recommendations: { source: string; target: string; score: number; reasons: string[]; type: string; priority: string; direction: "incoming" | "outgoing"; anchorHint?: string }[];
-  pages: Record<string, { title: string; h1: string; meta: string }>;
-  targetsByAnchor: Record<string, string[]>;
-  summary: unknown;
-  conflicts: unknown[];
-  cannibalization: unknown[];
-};
+type Enriched = Awaited<ReturnType<typeof enrichRecommendation>>;
 
-type Enriched = {
-  recommendation?: { source: string; target: string; anchor: string; passage: string; score: number; direction: "incoming" | "outgoing"; conflict: boolean; type: string; priority: string };
-  error?: string;
-};
+async function readPrivateCsv(url: string) {
+  const blob = await get(url, { access: "private" });
+  if (!blob) throw new Error("Fichier Blob introuvable");
+  return parseCsv(await new Response(blob.stream).text());
+}
 
 export async function analyzeWorkflow(args: AnalyzeArgs) {
   "use workflow";
   const { inlinksUrl, crawlUrl, targetUrls, mappingUrl, runId } = args;
 
-  const prepared = await prepareStep({ inlinksUrl, crawlUrl, targetUrls, mappingUrl, runId });
+  const { rawCount } = await prepareStep({ inlinksUrl, crawlUrl, targetUrls, mappingUrl, runId });
 
-  const recs = prepared.recommendations.slice(0, 8);
   const enriched = await Promise.all(
-    recs.map((rec) => processSourceStep({ rec, pages: prepared.pages, targetsByAnchor: prepared.targetsByAnchor, runId })),
+    Array.from({ length: rawCount }, (_, index) => processSourceStep({ runId, index })),
   );
 
-  await finalizeStep({ runId, prepared, enriched });
+  await finalizeStep({ runId, enriched });
 }
 
 async function prepareStep(args: AnalyzeArgs) {
   "use step";
-  // TODO: brancher prepareCrawl pour générer les candidats sans Jina
-  const stub: Prepared = {
-    status: "preparing",
-    runId: args.runId,
-    recommendations: [],
-    pages: {},
-    targetsByAnchor: {},
-    summary: { pages: 0 },
-    conflicts: [],
-    cannibalization: [],
-  };
-  await saveRunState<Prepared>(args.runId, stub);
-  return stub;
+  const [inlinks, crawl, mapping] = await Promise.all([
+    readPrivateCsv(args.inlinksUrl),
+    readPrivateCsv(args.crawlUrl),
+    args.mappingUrl ? readPrivateCsv(args.mappingUrl).then(parseMapping) : Promise.resolve([]),
+  ]);
+
+  const prepared = await prepareCrawl(inlinks, crawl, args.targetUrls?.filter(Boolean), mapping);
+  await saveRunState(args.runId, { ...prepared, status: "preparing", phase: "Analyse du graphe et scoring" });
+
+  return { runId: args.runId, rawCount: prepared.raw.length };
 }
 
-async function processSourceStep({ rec, pages, targetsByAnchor, runId }: { rec: Prepared["recommendations"][0]; pages: Prepared["pages"]; targetsByAnchor: Prepared["targetsByAnchor"]; runId: string }) {
+async function processSourceStep({ runId, index }: { runId: string; index: number }) {
   "use step";
-  // TODO: brancher enrichRecommendation avec Jina
-  console.log("process source", rec.source, "for run", runId);
-  return { recommendation: undefined, error: "stub" } as Enriched;
+  const prepared = await loadPrepared(runId);
+  const rec = prepared.raw[index];
+  if (!rec) throw new Error(`Recommandation ${index} introuvable`);
+  return enrichRecommendation(rec, prepared.pages, prepared.targetsByAnchor, 45_000);
 }
 
-async function finalizeStep({ runId, prepared, enriched }: { runId: string; prepared: Prepared; enriched: Enriched[] }) {
+async function finalizeStep({ runId, enriched }: { runId: string; enriched: Enriched[] }) {
   "use step";
-  const recommendations = enriched.map((e) => e.recommendation).filter((r): r is NonNullable<typeof r> => Boolean(r));
-  await saveRunState(runId, {
-    status: "done",
-    runId,
-    summary: prepared.summary,
-    conflicts: prepared.conflicts,
-    cannibalization: prepared.cannibalization,
-    recommendations,
-  });
+  const prepared = await loadPrepared(runId);
+  const result = buildResult(prepared, enriched);
+  await saveRunState(runId, { ...result, status: "done", phase: "Analyse terminée" });
+}
+
+async function loadPrepared(runId: string): Promise<Prepared> {
+  const blob = await get(`workflow-runs/${runId}.json`, { access: "private" });
+  if (!blob) throw new Error("État de l’analyse introuvable");
+  return JSON.parse(await new Response(blob.stream).text()) as Prepared;
 }
