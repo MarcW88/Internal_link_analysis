@@ -11,7 +11,7 @@ function assertPublicUrl(value: string) {
   return url;
 }
 
-export async function readWithJina(value: string) {
+export async function readWithJina(value: string, timeout = 45_000) {
   const url = assertPublicUrl(value);
   const apiKey = process.env.JINA_API_KEY;
   if (!apiKey) throw new Error("JINA_API_KEY is not configured");
@@ -21,7 +21,7 @@ export async function readWithJina(value: string) {
       Authorization: `Bearer ${apiKey}`,
       Accept: "text/plain",
     },
-    signal: AbortSignal.timeout(45_000),
+    signal: AbortSignal.timeout(timeout),
   });
 
   if (!response.ok) throw new Error(`Jina Reader failed with status ${response.status}`);

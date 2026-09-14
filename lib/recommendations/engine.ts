@@ -460,41 +460,37 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   const scrapeErrors = new Set<string>();
   const sourceBlocks = new Map<string, ContentBlock[]>();
 
-  const topRecs = rawRecommendations.slice(0, targets?.length ? 15 : 10);
-
-  if (!targets?.length) {
-    const uniqueSources = [...new Set(topRecs.map((r) => r.source))];
-    await Promise.all(uniqueSources.map(async (source) => {
-      try {
-        sourceBlocks.set(source, extractContentBlocks(await readWithJina(source)));
-        scrapedPages += 1;
-      } catch (error) {
-        scrapeFailures += 1;
-        scrapeErrors.add(error instanceof Error ? error.message : "Scraping impossible");
-        sourceBlocks.set(source, []);
-      }
-    }));
-  }
+  const topRecs = rawRecommendations.slice(0, targets?.length ? 12 : 10);
+  const scrapeLimit = targets?.length ? 5 : 10;
+  const uniqueSources = [...new Set(topRecs.map((r) => r.source))].slice(0, scrapeLimit);
+  const jinaTimeout = targets?.length ? 12_000 : 45_000;
+  await Promise.all(uniqueSources.map(async (source) => {
+    try {
+      sourceBlocks.set(source, extractContentBlocks(await readWithJina(source, jinaTimeout)));
+      scrapedPages += 1;
+    } catch (error) {
+      scrapeFailures += 1;
+      scrapeErrors.add(error instanceof Error ? error.message : "Scraping impossible");
+      sourceBlocks.set(source, []);
+    }
+  }));
 
   for (const rec of topRecs) {
     const target = pageAnalysis.get(rec.target)!;
     const fallbackAnchor = rec.anchorHint || target.h1 || target.title;
-
-    if (!targets?.length) {
-      const blocks = sourceBlocks.get(rec.source);
-      if (blocks?.length) {
-        const selected = selectExistingAnchor(blocks, { title: target.title || target.h1, keyword: rec.anchorHint || target.h1 });
-        if (selected) {
-          const normalized = selected.anchor.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
-          const targetsForAnchor = targetsByAnchor.get(normalized);
-          const conflict = Boolean(targetsForAnchor && [...targetsForAnchor].some((url) => url !== rec.target));
-          if (conflict) continue;
-          const score = Math.round(rec.score * 0.55 + (selected.quality / 100) * 45);
-          recommendations.push({ source: rec.source, target: rec.target, anchor: selected.anchor, passage: selected.passage, score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
-          continue;
-        }
-        passagesWithoutAnchor += 1;
+    const blocks = sourceBlocks.get(rec.source);
+    if (blocks?.length) {
+      const selected = selectExistingAnchor(blocks, { title: target.title || target.h1, keyword: rec.anchorHint || target.h1 });
+      if (selected) {
+        const normalized = selected.anchor.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+        const targetsForAnchor = targetsByAnchor.get(normalized);
+        const conflict = Boolean(targetsForAnchor && [...targetsForAnchor].some((url) => url !== rec.target));
+        if (conflict) continue;
+        const score = Math.round(rec.score * 0.55 + (selected.quality / 100) * 45);
+        recommendations.push({ source: rec.source, target: rec.target, anchor: selected.anchor, passage: selected.passage, score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
+        continue;
       }
+      passagesWithoutAnchor += 1;
     }
 
     if (fallbackAnchor) {
