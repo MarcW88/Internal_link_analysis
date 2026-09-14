@@ -1,6 +1,5 @@
 import type { CsvRow } from "@/lib/ingest/csv";
 import { pageRank } from "@/lib/graph/pagerank";
-import { computeIdf, tfIdfCosine } from "@/lib/semantic/tfidf";
 import type { EmbeddingMap } from "@/lib/semantic/embeddings";
 import { parseMapping, type MappingRow } from "@/lib/ingest/mapping";
 import { buildHubSpokeRecommendations, type HubSpokeRec } from "@/lib/recommendations/hubspoke";
@@ -269,11 +268,6 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
     page.seoScore = Math.round(contentScore * 30 + sourcesScore * 30 + (1 - sitewideRatio) * 20 + anchorScore * 20);
   }
 
-  const indexablePages = [...pageAnalysis.values()].filter((p) => p.indexable);
-  const pageTexts = indexablePages.map((p) => `${p.title} ${p.h1} ${p.meta}`.trim() || p.url);
-  const pageUrls = indexablePages.map((p) => p.url);
-  const idf = computeIdf(pageTexts);
-
   const pageEmbeddings: EmbeddingMap = new Map();
 
   const keywordCannibals: { keyword: string; urls: string[] }[] = [];
@@ -326,13 +320,13 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
     const sourceText = `${source.title} ${source.h1} ${source.meta}`.trim();
     const targetText = `${target.title} ${target.h1} ${target.meta}`.trim();
     if (sourceText && targetText) {
-      const tfidf = tfIdfCosine(sourceText, targetText, idf);
-      score += tfidf * 40;
-      if (tfidf > 0.3) {
+      const overlap = overlapScore(sourceText, targetText);
+      score += overlap * 40;
+      if (overlap > 0.3) {
         const s = tokenSet(sourceText, 3);
         const t = tokenSet(targetText, 3);
-        const overlap = [...s].filter((w) => t.has(w));
-        if (overlap.length) reasons.push(`Mots communs: ${overlap.slice(0, 3).join(", ")}`);
+        const common = [...s].filter((w) => t.has(w));
+        if (common.length) reasons.push(`Mots communs: ${common.slice(0, 3).join(", ")}`);
       }
     }
 
