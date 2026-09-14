@@ -5,3 +5,12 @@
 __pycache__/
 *.pyc
 .env
+.env.local
+.env.*.local
+.next/
+node_modules/
+.vercel/
+*.tsbuildinfo
+.vercel
+.env*
+!.env.example
