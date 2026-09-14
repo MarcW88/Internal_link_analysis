@@ -1,10 +1,7 @@
 import type { CsvRow } from "@/lib/ingest/csv";
-import { extractContentBlocks, type ContentBlock } from "@/lib/content/blocks";
-import { readWithJina } from "@/lib/content/jina";
-import { selectExistingAnchor } from "@/lib/anchors/select";
 import { pageRank } from "@/lib/graph/pagerank";
 import { computeIdf, tfIdfCosine } from "@/lib/semantic/tfidf";
-import { embedPages, embeddingSimilarity, type EmbeddingMap } from "@/lib/semantic/embeddings";
+import type { EmbeddingMap } from "@/lib/semantic/embeddings";
 import { parseMapping, type MappingRow } from "@/lib/ingest/mapping";
 import { buildHubSpokeRecommendations, type HubSpokeRec } from "@/lib/recommendations/hubspoke";
 
@@ -277,17 +274,7 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   const pageUrls = indexablePages.map((p) => p.url);
   const idf = computeIdf(pageTexts);
 
-  let pageEmbeddings: EmbeddingMap = new Map();
-  let embeddingError = "";
-  if (targets?.length) {
-    embeddingError = "Embeddings désactivés en mode URL cible pour accélérer l’analyse";
-  } else {
-    try {
-      pageEmbeddings = await embedPages(pageUrls, pageTexts);
-    } catch (error) {
-      embeddingError = error instanceof Error ? error.message : "Embeddings non disponibles";
-    }
-  }
+  const pageEmbeddings: EmbeddingMap = new Map();
 
   const keywordCannibals: { keyword: string; urls: string[] }[] = [];
   if (mappingRows?.length) {
@@ -317,11 +304,8 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
         if (!bTokens.size) continue;
         const common = [...aTokens].filter((w) => bTokens.has(w)).length;
         const tokenOverlap = common / Math.sqrt(aTokens.size * bTokens.size);
-        if (tokenOverlap < 0.25) continue;
-        const sim = embeddingSimilarity(pageEmbeddings, a.url, b.url);
-        if (sim > 0.82) {
-          semanticCannibals.push({ urls: [a.url, b.url], similarity: sim, reason: "Titres/H1 très proches et similarité sémantique élevée" });
-        }
+        if (tokenOverlap < 0.7) continue;
+        semanticCannibals.push({ urls: [a.url, b.url], similarity: tokenOverlap, reason: "Titres/H1 très proches" });
       }
     }
   }
@@ -343,10 +327,8 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
     const targetText = `${target.title} ${target.h1} ${target.meta}`.trim();
     if (sourceText && targetText) {
       const tfidf = tfIdfCosine(sourceText, targetText, idf);
-      const embedding = pageEmbeddings.size ? embeddingSimilarity(pageEmbeddings, sourceUrl, targetUrl) : 0;
-      const semantic = 0.6 * tfidf + 0.4 * embedding;
-      score += semantic * 40;
-      if (semantic > 0.3) {
+      score += tfidf * 40;
+      if (tfidf > 0.3) {
         const s = tokenSet(sourceText, 3);
         const t = tokenSet(targetText, 3);
         const overlap = [...s].filter((w) => t.has(w));
@@ -456,45 +438,13 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   });
 
   const recommendations = [] as Array<{ source: string; target: string; anchor: string; passage: string; score: number; direction: "incoming" | "outgoing"; conflict: boolean; type: string; priority: Priority }>;
-  let scrapedPages = 0; let scrapeFailures = 0; let passagesWithoutAnchor = 0;
-  const scrapeErrors = new Set<string>();
-  const sourceBlocks = new Map<string, ContentBlock[]>();
-
-  const topRecs = rawRecommendations.slice(0, targets?.length ? 12 : 10);
-  const scrapeLimit = targets?.length ? 5 : 10;
-  const uniqueSources = [...new Set(topRecs.map((r) => r.source))].slice(0, scrapeLimit);
-  const jinaTimeout = targets?.length ? 12_000 : 45_000;
-  await Promise.all(uniqueSources.map(async (source) => {
-    try {
-      sourceBlocks.set(source, extractContentBlocks(await readWithJina(source, jinaTimeout)));
-      scrapedPages += 1;
-    } catch (error) {
-      scrapeFailures += 1;
-      scrapeErrors.add(error instanceof Error ? error.message : "Scraping impossible");
-      sourceBlocks.set(source, []);
-    }
-  }));
+  const topRecs = rawRecommendations.slice(0, targets?.length ? 15 : 12);
 
   for (const rec of topRecs) {
     const target = pageAnalysis.get(rec.target)!;
-    const fallbackAnchor = rec.anchorHint || target.h1 || target.title;
-    const blocks = sourceBlocks.get(rec.source);
-    if (blocks?.length) {
-      const selected = selectExistingAnchor(blocks, { title: target.title || target.h1, keyword: rec.anchorHint || target.h1 });
-      if (selected) {
-        const normalized = selected.anchor.toLocaleLowerCase("fr").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
-        const targetsForAnchor = targetsByAnchor.get(normalized);
-        const conflict = Boolean(targetsForAnchor && [...targetsForAnchor].some((url) => url !== rec.target));
-        if (conflict) continue;
-        const score = Math.round(rec.score * 0.55 + (selected.quality / 100) * 45);
-        recommendations.push({ source: rec.source, target: rec.target, anchor: selected.anchor, passage: selected.passage, score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
-        continue;
-      }
-      passagesWithoutAnchor += 1;
-    }
-
-    if (fallbackAnchor) {
-      recommendations.push({ source: rec.source, target: rec.target, anchor: fallbackAnchor, passage: rec.reasons.join(" | "), score: rec.score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
+    const anchor = rec.anchorHint || target.h1 || target.title;
+    if (anchor) {
+      recommendations.push({ source: rec.source, target: rec.target, anchor, passage: rec.reasons.join(" | "), score: rec.score, direction: rec.direction, conflict: false, type: rec.type, priority: rec.priority });
     }
   }
 
@@ -523,13 +473,9 @@ export async function analyzeCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
       averagePageRank: Math.round([...pageAnalysis.values()].reduce((sum, p) => sum + p.pageRank, 0) / Math.max(pageAnalysis.size, 1) * 100),
       conflicts: conflicts.length,
       cannibalization: cannibalization.length,
-      scrapedPages,
-      scrapeFailures,
-      passagesWithoutAnchor,
       recommendations: recommendations.length,
       averageSeoScore: Math.round([...pageAnalysis.values()].reduce((sum, p) => sum + p.seoScore, 0) / Math.max(pageAnalysis.size, 1)),
     },
-    scrapeErrors: [...scrapeErrors],
     conflicts,
     cannibalization,
     recommendations: recommendations.sort((a, b) => b.score - a.score),
