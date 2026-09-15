@@ -1,10 +1,19 @@
+import { get } from "@vercel/blob";
 import { NextResponse } from "next/server";
 import { start } from "workflow/api";
-import { saveRunState } from "@/lib/analysis/state";
+import { parseCsv } from "@/lib/ingest/csv";
+import { parseMapping } from "@/lib/ingest/mapping";
+import { createRun, setRunInputs } from "@/lib/analysis/state";
 import { analyzeWorkflow } from "@/workflows/analyze";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+async function readPrivateCsv(url: string) {
+  const blob = await get(url, { access: "private" });
+  if (!blob) throw new Error("Fichier Blob introuvable");
+  return parseCsv(await new Response(blob.stream).text());
+}
 
 export async function POST(request: Request) {
   try {
@@ -26,13 +35,17 @@ export async function POST(request: Request) {
     }
 
     const runId = crypto.randomUUID();
-    await saveRunState(runId, { status: "pending", progress: 0, phase: "Démarrage" });
+    await createRun(runId, "pending", "Démarrage");
+
+    const [inlinks, crawl, mapping] = await Promise.all([
+      readPrivateCsv(inlinksUrl),
+      readPrivateCsv(crawlUrl),
+      mappingUrl ? readPrivateCsv(mappingUrl).then(parseMapping) : Promise.resolve([]),
+    ]);
+
+    await setRunInputs(runId, inlinks, crawl, mapping, targetUrls?.filter(Boolean));
 
     await start(analyzeWorkflow, [{
-      inlinksUrl,
-      crawlUrl,
-      targetUrls: targetUrls?.filter(Boolean),
-      mappingUrl,
       runId,
     }]);
 
