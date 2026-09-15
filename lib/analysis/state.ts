@@ -49,6 +49,15 @@ export async function createRun(
   );
 }
 
+export async function setRunStatus(runId: string, status: string, phase: string) {
+  const sql = database();
+  await ensureTables();
+  await sql.query(
+    "update analysis_runs set status = $2, phase = $3, updated_at = now() where id = $1",
+    [runId, status, phase],
+  );
+}
+
 export async function setRunInputs(
   runId: string,
   inlinks: unknown,

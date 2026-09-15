@@ -3,7 +3,7 @@ import { extractContentBlocks, type ContentBlock } from "@/lib/content/blocks";
 import { readWithJina } from "@/lib/content/jina";
 import { selectExistingAnchor } from "@/lib/anchors/select";
 import { pageRank } from "@/lib/graph/pagerank";
-import { computeIdf, tfIdfCosine } from "@/lib/semantic/tfidf";
+import { computeIdf, cosineBetween, tfIdfVector } from "@/lib/semantic/tfidf";
 import { embedPages, embeddingSimilarity, type EmbeddingMap } from "@/lib/semantic/embeddings";
 import { parseMapping, type MappingRow } from "@/lib/ingest/mapping";
 import { buildHubSpokeRecommendations, type HubSpokeRec } from "@/lib/recommendations/hubspoke";
@@ -244,6 +244,7 @@ export async function prepareCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   const footerIncomingMap = new Map<string, number>();
   const outgoingContentMap = new Map<string, number>();
   const targetsByAnchor = new Map<string, Set<string>>();
+  const contentSourcesByTarget = new Map<string, Set<string>>();
   const anchorMap = new Map<string, { count: number; types: Record<string, number> }>();
 
   for (const link of kept) {
@@ -254,6 +255,9 @@ export async function prepareCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
     if (link.positionType === "Footer") footerIncomingMap.set(link.target, (footerIncomingMap.get(link.target) ?? 0) + 1);
     if (link.positionType === "Content" && link.source) {
       outgoingContentMap.set(link.source, (outgoingContentMap.get(link.source) ?? 0) + 1);
+      const sourceSet = contentSourcesByTarget.get(link.target) ?? new Set<string>();
+      sourceSet.add(link.source);
+      contentSourcesByTarget.set(link.target, sourceSet);
       if (link.anchor) {
         const key = normalizeText(link.anchor);
         if (key) {
@@ -298,21 +302,34 @@ export async function prepareCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   const navLinks = kept.filter((l) => l.positionType === "Navigation").length;
   const footerLinks = kept.filter((l) => l.positionType === "Footer").length;
 
+  const maxContentIncoming = Math.max(1, ...contentIncomingMap.values());
+  const maxUniqueSources = Math.max(1, ...[...contentSourcesByTarget.values()].map((s) => s.size));
+
   for (const page of pageAnalysis.values()) {
     const types = anchorMap.get(page.url)?.types ?? {};
     const descriptive = types.descriptive ?? 0;
     const total = page.incoming || 1;
-    const contentScore = page.contentIncoming / Math.max(...[...pageAnalysis.values()].map((p) => p.contentIncoming), 1);
-    const sourcesScore = new Set(kept.filter((l) => l.target === page.url && l.positionType === "Content").map((l) => l.source)).size / Math.max(...[...pageAnalysis.values()].map((p) => p.contentIncoming), 1);
+    const contentScore = page.contentIncoming / maxContentIncoming;
+    const sourcesScore = (contentSourcesByTarget.get(page.url)?.size ?? 0) / maxUniqueSources;
     const sitewideRatio = page.incoming ? (page.navIncoming + page.footerIncoming) / page.incoming : 0;
     const anchorScore = descriptive / total;
     page.seoScore = Math.round(contentScore * 30 + sourcesScore * 30 + (1 - sitewideRatio) * 20 + anchorScore * 20);
   }
 
-  const indexablePages = [...pageAnalysis.values()].filter((p) => p.indexable);
+  const indexablePages = [...pageAnalysis.values()].filter((p) => p.indexable && p.wordCount > 0);
   const pageTexts = indexablePages.map((p) => `${p.title} ${p.h1} ${p.meta}`.trim() || p.url);
   const pageUrls = indexablePages.map((p) => p.url);
   const idf = computeIdf(pageTexts);
+
+  const pageTokenSets = new Map<string, Set<string>>();
+  const pageVectors = new Map<string, Map<string, number>>();
+  const pagePathNames = new Map<string, string[]>();
+  for (const p of indexablePages) {
+    const text = `${p.title} ${p.h1} ${p.meta}`.trim() || p.url;
+    pageTokenSets.set(p.url, tokenSet(text, 3));
+    pageVectors.set(p.url, tfIdfVector(text, idf));
+    pagePathNames.set(p.url, new URL(p.url).pathname.toLowerCase().split("/").filter(Boolean));
+  }
 
   let pageEmbeddings: EmbeddingMap = new Map();
   let embeddingError = "";
@@ -364,29 +381,30 @@ export async function prepareCrawl(inlinkRows: CsvRow[], crawlRows: CsvRow[], ta
   }
 
   function getThematicScore(sourceUrl: string, targetUrl: string) {
-    const source = pageAnalysis.get(sourceUrl)!;
-    const target = pageAnalysis.get(targetUrl)!;
+    const source = pageAnalysis.get(sourceUrl);
+    const target = pageAnalysis.get(targetUrl);
+    if (!source || !target) return { score: 0, reasons: [] };
     let score = 0;
     const reasons: string[] = [];
 
-    const sourcePath = new URL(sourceUrl).pathname.toLowerCase().split("/").filter(Boolean);
-    const targetPath = new URL(targetUrl).pathname.toLowerCase().split("/").filter(Boolean);
+    const sourcePath = pagePathNames.get(sourceUrl) ?? [];
+    const targetPath = pagePathNames.get(targetUrl) ?? [];
     if (sourcePath[0] && targetPath[0] && sourcePath[0] === targetPath[0]) {
       score += 30;
       reasons.push(`Même section /${sourcePath[0]}/`);
     }
 
-    const sourceText = `${source.title} ${source.h1} ${source.meta}`.trim();
-    const targetText = `${target.title} ${target.h1} ${target.meta}`.trim();
-    if (sourceText && targetText) {
-      const tfidf = tfIdfCosine(sourceText, targetText, idf);
+    const sourceTokens = pageTokenSets.get(sourceUrl);
+    const targetTokens = pageTokenSets.get(targetUrl);
+    const sourceVector = pageVectors.get(sourceUrl);
+    const targetVector = pageVectors.get(targetUrl);
+    if (sourceTokens?.size && targetTokens?.size && sourceVector && targetVector) {
+      const tfidf = cosineBetween(sourceVector, targetVector);
       const embedding = pageEmbeddings.size ? embeddingSimilarity(pageEmbeddings, sourceUrl, targetUrl) : 0;
       const semantic = 0.6 * tfidf + 0.4 * embedding;
       score += semantic * 40;
       if (semantic > 0.3) {
-        const s = tokenSet(sourceText, 3);
-        const t = tokenSet(targetText, 3);
-        const overlap = [...s].filter((w) => t.has(w));
+        const overlap = [...sourceTokens].filter((w) => targetTokens.has(w));
         if (overlap.length) reasons.push(`Mots communs: ${overlap.slice(0, 3).join(", ")}`);
       }
     }

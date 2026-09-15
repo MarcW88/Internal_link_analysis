@@ -6,6 +6,7 @@ import {
   getRunPrepared,
   setRunPrepared,
   setRunResult,
+  setRunStatus,
 } from "@/lib/analysis/state";
 
 export async function analyzeWorkflow(args: { runId: string }) {
@@ -26,10 +27,16 @@ async function prepareStep(args: { runId: string }) {
   const inputs = await getRunInputs(args.runId);
   if (!inputs) throw new Error("Données d’analyse introuvables");
 
-  const prepared = await prepareCrawl(inputs.inlinks, inputs.crawl, inputs.targets, inputs.mapping || undefined);
-  await setRunPrepared(args.runId, prepared);
-
-  return { runId: args.runId, rawCount: prepared.raw.length };
+  await setRunStatus(args.runId, "preparing", "Analyse du graphe et scoring");
+  try {
+    const prepared = await prepareCrawl(inputs.inlinks, inputs.crawl, inputs.targets, inputs.mapping || undefined);
+    await setRunPrepared(args.runId, prepared);
+    return { runId: args.runId, rawCount: prepared.raw.length };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Échec de la préparation";
+    await setRunStatus(args.runId, "error", message);
+    throw error;
+  }
 }
 
 async function processSourceStep({ runId, index }: { runId: string; index: number }) {

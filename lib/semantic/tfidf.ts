@@ -37,7 +37,7 @@ function computeTfVector(text: string) {
   return vector;
 }
 
-function tfIdfVector(text: string, idf: Map<string, number>) {
+export function tfIdfVector(text: string, idf: Map<string, number>) {
   const vector = new Map<string, number>();
   for (const [term, tf] of computeTfVector(text).entries()) {
     vector.set(term, tf * (idf.get(term) ?? 0));
@@ -60,6 +60,10 @@ function magnitude(vector: Map<string, number>) {
 export function tfIdfCosine(left: string, right: string, idf: Map<string, number>) {
   const a = tfIdfVector(left, idf);
   const b = tfIdfVector(right, idf);
+  return cosineBetween(a, b);
+}
+
+export function cosineBetween(a: Map<string, number>, b: Map<string, number>) {
   const denominator = magnitude(a) * magnitude(b);
   return denominator ? dotProduct(a, b) / denominator : 0;
 }
